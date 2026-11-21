@@ -27,13 +27,19 @@ Layout (one block per schedule/week, stacked vertically):
   wrapped.
 
 Usage:
+    python schedule_to_xlsx.py [-o schedule.xlsx]
     python schedule_to_xlsx.py schedule.json [more.json ...] -o schedule.xlsx
 
+With no JSON files, fetch the Services Master Schedule for the upcoming Sunday
+(or today if it is Sunday) from CCB using the settings in config.json.
 Each input file may contain a single schedule object or a list of them.  All
 schedules are sorted by start date and stacked on one sheet, so passing one
 JSON per week yields a multi-week sheet like the PDF.
+The console output lists the contributing JSON files or the CCB schedule ID
+and start date.
 
-Requires: openpyxl (Pillow optional, for accurate width measurement).
+Requires: openpyxl; CCB fetching also requires requests and dateparser.
+Pillow is optional, for accurate width measurement.
 """
 from __future__ import annotations
 
@@ -42,12 +48,10 @@ import json
 import math
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-import dateparser
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from pprint import pprint
+from urllib.parse import urlsplit
 
-import requests
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -57,8 +61,6 @@ from openpyxl.utils import get_column_letter
 # --------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
-with CONFIG_PATH.open(encoding="utf-8-sig") as config_file:
-    config = json.load(config_file)
 
 TITLE = "Services Master Schedule"
 SHEET_NAME = "Services Master Schedule"
@@ -112,64 +114,6 @@ category_map = {
         'teams_to_track':  {},
     },
 }
-
-# We want the next Sunday schedule (or today, if today is Sunday)
-now = datetime.now().date()
-target_sunday = now + timedelta(days=7 - now.isoweekday())
-
-login_url = f"{config['ccb_api_url']}/login"
-schedule_list_url  = f"{config['ccb_api_url']}/scheduling/categories/{{category_id}}/schedules?page=1&with_metrics=1&after={{lastweek}}"
-schedule_fetch_url = f'{config["ccb_api_url"]}/scheduling/categories/{{category_id}}/schedules?get_full_schedules=true&schedule_ids[]={{schedule_id}}'
-
-ccb_session = requests.Session()
-authlogin = ccb_session.post(
-    login_url,
-    data={
-        "username": config["ccb_api_username"],
-        "password": config["ccb_api_password"],
-        "keep_me_logged_in": False,
-        "accept_privacy_policy": False,
-    },
-    timeout=30,
-)
-authlogin.raise_for_status()
-cookies = authlogin.cookies
-
-print(f'[*] Getting all schedule IDs')
-schedule_found = False
-lastweek = (now - timedelta(days=7)).strftime('%Y-%m-%d')
-print(f'[*] Using lastweek date of "{lastweek}"')
-
-req = schedule_list_url.format(category_id=category_map['master']['category_id'], lastweek=lastweek)
-print(f'[*] Calling: {req}')
-r = requests.get(req, cookies=cookies)
-try:
-    data = r.json()
-    for schedule in data:
-        schedule_id = schedule.get('id')
-        schedule_start = dateparser.parse(schedule.get('start')).date()
-        schedule_end   = dateparser.parse(schedule.get('end')).date()
-        print(f'  [*] Schedule ID {schedule_id} runs from {schedule_start} to {schedule_end}')
-        if schedule_start == target_sunday:
-            print(f'  [*] Correct schedule found (ID {schedule_id})')
-            schedule_found = True
-            break
-except json.decoder.JSONDecodeError:
-    print("  [!] Did not get valid JSON")
-    print("  Instead, got this:", r.text)
-    pass
-
-
-req = schedule_fetch_url.format(category_id=category_map['master']['category_id'], schedule_id=schedule_id)
-print(f'  [*] Calling: {req}')
-r = requests.get(req, cookies=cookies)
-try:
-    data = r.json()[0]
-except (json.decoder.JSONDecodeError, IndexError):
-    print("  [!] Did not get valid JSON")
-    raise
-    sys.exit()
-
 
 # --------------------------------------------------------------------------
 # Text measurement (to size columns from the displayed text)
@@ -266,16 +210,105 @@ class Block:
     positions: list             # list[Position], only those with >= 1 row
 
 
-def load_schedules(paths) -> list:
+def load_schedules(paths: list[str]) -> tuple[list[dict], list[str]]:
     schedules = []
+    source_files = []
     for path in paths:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
             data = data.get("schedules", [data]) if "events" not in data else [data]
-        schedules.extend(s for s in data if isinstance(s, dict) and "events" in s)
+        file_schedules = [s for s in data if isinstance(s, dict) and "events" in s]
+        if file_schedules:
+            schedules.extend(file_schedules)
+            source_files.append(path)
     schedules.sort(key=lambda s: parse_dt(s.get("start")) or datetime.max)
-    return schedules
+    return schedules, source_files
+
+
+def fetch_ccb_schedule() -> tuple[dict, int | str, date]:
+    """Fetch the upcoming Sunday master schedule, its CCB ID, and its start date."""
+    import dateparser
+    import requests
+
+    try:
+        with CONFIG_PATH.open(encoding="utf-8-sig") as config_file:
+            config = json.load(config_file)
+    except (OSError, ValueError):
+        raise ValueError("Cannot read a valid config.json for CCB.") from None
+
+    required_keys = ("ccb_api_url", "ccb_api_username", "ccb_api_password")
+    if not isinstance(config, dict) or any(
+        not isinstance(config.get(key), str) or not config[key].strip() for key in required_keys
+    ):
+        raise ValueError("config.json must set ccb_api_url, ccb_api_username, and ccb_api_password.")
+
+    base_url = config["ccb_api_url"].strip().rstrip("/")
+    url = urlsplit(base_url)
+    if url.scheme != "https" or not url.hostname or url.username is not None or url.query or url.fragment:
+        raise ValueError("ccb_api_url must be an HTTPS base URL without credentials, query, or fragment.")
+
+    today = datetime.now().date()
+    target_sunday = today + timedelta(days=7 - today.isoweekday())
+    last_week = (today - timedelta(days=7)).isoformat()
+    category_id = category_map["master"]["category_id"]
+    schedules_url = f"{base_url}/scheduling/categories/{category_id}/schedules"
+    request_options = {"timeout": 30, "allow_redirects": False}
+
+    try:
+        with requests.Session() as session:
+            login = session.post(
+                f"{base_url}/login",
+                data={
+                    "username": config["ccb_api_username"],
+                    "password": config["ccb_api_password"],
+                    "keep_me_logged_in": False,
+                    "accept_privacy_policy": False,
+                },
+                **request_options,
+            )
+            login.raise_for_status()
+            listing = session.get(
+                schedules_url,
+                params={"page": 1, "with_metrics": 1, "after": last_week},
+                **request_options,
+            )
+            listing.raise_for_status()
+            summaries = listing.json()
+            if not isinstance(summaries, list):
+                raise ValueError("CCB did not return a list of schedules.")
+
+            for summary in summaries:
+                start = summary.get("start") if isinstance(summary, dict) else None
+                parsed_start = dateparser.parse(start) if isinstance(start, str) and start else None
+                if parsed_start and parsed_start.date() == target_sunday:
+                    schedule_id = summary.get("id")
+                    if not isinstance(schedule_id, (int, str)) or not schedule_id:
+                        raise ValueError(f"The CCB schedule for {target_sunday} has no valid ID.")
+                    break
+            else:
+                raise ValueError(f"No CCB master schedule found for {target_sunday}.")
+
+            full = session.get(
+                schedules_url,
+                params={"get_full_schedules": "true", "schedule_ids[]": schedule_id},
+                **request_options,
+            )
+            full.raise_for_status()
+            schedules = full.json()
+    except requests.exceptions.JSONDecodeError:
+        raise ValueError("CCB returned invalid JSON.") from None
+    except requests.HTTPError as exc:
+        raise ValueError(f"CCB API returned HTTP {exc.response.status_code}.") from None
+    except requests.RequestException:
+        raise ValueError("Could not connect to the CCB API.") from None
+
+    if not isinstance(schedules, list) or not schedules or not isinstance(schedules[0], dict):
+        raise ValueError(f"CCB did not return full schedule data for {target_sunday}.")
+    schedule = schedules[0]
+    if not isinstance(schedule.get("events"), list) or not schedule["events"]:
+        raise ValueError(f"The CCB schedule for {target_sunday} contains no events.")
+    return schedule, schedule_id, target_sunday
 
 
 def event_sort_key(event: dict):
@@ -397,6 +430,12 @@ def write_workbook(blocks: list, out_path: str, title: str = TITLE):
     def need_text(col, text):
         need[col] = max(need[col], MEASURE.width(text) + PAD_CHARS)
 
+    def text_cell(row, col, text):
+        cell = ws.cell(row, col, text)
+        if text is not None:
+            cell.data_type = "s"  # Treat schedule text as literal, not as Excel formulas.
+        return cell
+
     # Title -------------------------------------------------------------------
     ws.cell(1, 1, title).font = Font(name=FONT_NAME, size=TITLE_SIZE, bold=True)
     ws.cell(1, 1).alignment = Alignment(vertical="center")
@@ -411,7 +450,7 @@ def write_workbook(blocks: list, out_path: str, title: str = TITLE):
 
         # Week header (merged across all event columns) -----------------------
         merges = [(row, 2, row, last_col)]
-        c = ws.cell(row, 2, block.header)
+        c = text_cell(row, 2, block.header)
         c.font, c.fill = font, fill["blue"]
         c.alignment = Alignment(horizontal="center", vertical="center")
         spans.append((2, last_col, MEASURE.width(block.header) + PAD_CHARS))
@@ -426,7 +465,7 @@ def write_workbook(blocks: list, out_path: str, title: str = TITLE):
             c1 = name_col[key]
             ename, etime = block.events.get(key, ("", ""))
             for hr, text in ((row + 1, ename), (row + 2, etime)):
-                cell = ws.cell(hr, c1, text or None)
+                cell = text_cell(hr, c1, text or None)
                 cell.font = font
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 merges.append((hr, c1, hr, c1 + 1))
@@ -443,7 +482,7 @@ def write_workbook(blocks: list, out_path: str, title: str = TITLE):
         team_runs = []   # (team_key, first row, last row)
         for pos in block.positions:
             for i in range(pos.row_count):
-                a = ws.cell(row, 1, pos.name)
+                a = text_cell(row, 1, pos.name)
                 a.font, a.fill = font, fill["blue"]
                 a.alignment = Alignment(horizontal="left", vertical="center")
                 need_text(1, pos.name)
@@ -457,9 +496,8 @@ def write_workbook(blocks: list, out_path: str, title: str = TITLE):
                     if i >= len(slots):
                         continue
                     slot = slots[i]
-                    n_cell, s_cell = ws.cell(row, c1), ws.cell(row, c1 + 1)
-                    n_cell.value = slot.name or None
-                    s_cell.value = slot.status
+                    n_cell = text_cell(row, c1, slot.name or None)
+                    s_cell = text_cell(row, c1 + 1, slot.status)
                     for cell, h in ((n_cell, "left"), (s_cell, "right")):
                         cell.font = font
                         cell.alignment = Alignment(horizontal=h, vertical="center")
@@ -526,7 +564,8 @@ def write_workbook(blocks: list, out_path: str, title: str = TITLE):
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Schedule JSON -> Services Master Schedule XLSX")
-    ap.add_argument("json_files", nargs="+", help="schedule JSON file(s); one block per schedule/week")
+    ap.add_argument("json_files", nargs="*",
+                    help="schedule JSON file(s); if omitted, fetch the upcoming Sunday from CCB")
     ap.add_argument("-o", "--output", default="Services_Master_Schedule.xlsx")
     ap.add_argument("--title", default=TITLE)
     ap.add_argument("--open-mode", choices=["needed", "unfilled"], default="needed",
@@ -534,12 +573,24 @@ def main(argv=None) -> int:
                          "(default), or quantity minus everyone listed incl. declined")
     args = ap.parse_args(argv)
 
-    schedules = load_schedules(args.json_files)
+    if args.json_files:
+        schedules, source_files = load_schedules(args.json_files)
+        file_label = "file" if len(source_files) == 1 else "files"
+        source = f"local JSON {file_label}: " + ", ".join(repr(path) for path in source_files)
+    else:
+        try:
+            schedule, schedule_id, start_date = fetch_ccb_schedule()
+        except (ImportError, ValueError) as exc:
+            print(f"Cannot fetch the CCB schedule: {exc}", file=sys.stderr)
+            return 1
+        schedules = [schedule]
+        source = f"CCB Services Master Schedule (ID {schedule_id!r}, starting {start_date})"
     if not schedules:
         print("No schedules found in input.", file=sys.stderr)
         return 1
     blocks = [build_block(s, args.open_mode) for s in schedules]
     write_workbook(blocks, args.output, args.title)
+    print(f"Source: {source}")
     print(f"Wrote {args.output}: {len(blocks)} week(s), "
           f"{sum(sum(p.row_count for p in b.positions) for b in blocks)} body rows")
     return 0
